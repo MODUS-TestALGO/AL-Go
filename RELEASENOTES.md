@@ -1,3 +1,15 @@
+### Conditional settings by GitHub repository custom properties
+
+Conditional settings can now include a `customProperties` object to match organization-defined repository metadata. All listed properties must match; each property's allowed-value array uses OR matching, supports case-insensitive wildcard patterns, and matches any value of a multi-select property. Missing and `null` properties do not match, unknown condition keys fail settings resolution, and API/authentication failures stop settings resolution. The `ReadSettings` action uses the workflow token and fetches properties only when needed.
+
+Actions that re-read settings during project discovery, dependency resolution, builds, delivery, and system-file updates also expose the workflow token to nested settings calls. This prevents unauthenticated custom-property requests (404 for private/internal repositories); an explicitly supplied `GITHUB_TOKEN` environment variable takes precedence.
+
+Telemetry settings are also resolved using the action's step-scoped token, so custom-property conditions do not prevent telemetry from being sent for private or internal repositories.
+
+Custom-property API requests require an authentication token and never retry anonymously after an authentication failure. The settings module supports both the action directory layout and the flattened helper downloads used by local and cloud development-environment scripts.
+
+Update all repositories that consume central conditional settings before enabling this condition. Older AL-Go versions ignore unknown condition keys and may apply a block without enforcing its property restriction. Property changes affect runtime settings on a later run; generated workflow settings such as `workflowSchedule` still require **Update AL-Go System Files**.
+
 ### Optional draft PR build skipping
 
 The new `skipDraftPullRequests` setting (default `false`) lets PTE and AppSource repositories skip AL-Go's built-in PR build jobs while a pull request is draft and build when it is marked ready for review. Custom jobs remain user-managed and are not modified. Default behavior and merge-queue builds are unchanged. Run **Update AL-Go System Files** after changing the setting. See [skipDraftPullRequests](Scenarios/settings.md#skipDraftPullRequests).
@@ -39,6 +51,8 @@ AL-Go for GitHub is now supported on GitHub Enterprise Edition with data residen
 AL-Go repositories can now opt in to AI-powered review of AL pull requests, with configurable models, target branches, excluded authors, and BCQuality skills and knowledge. See [Enable Copilot code review](Scenarios/Agents/CopilotCodeReview.md) for setup, organization policy requirements, and operational details.
 
 ### Issues
+
+- Issue 2443 - GitHub App token requests are now retried, so a transient error such as a 404 on the installation lookup no longer fails the workflow.
 
 - Issue 2454 - Fix separate test execution on Windows PowerShell 5.1 when an app contains multiple test codeunits, preserving each codeunit's ID and test methods.
 

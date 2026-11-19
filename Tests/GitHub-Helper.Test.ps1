@@ -1,6 +1,64 @@
 ﻿Get-Module Github-Helper | Remove-Module -Force
 Import-Module (Join-Path $PSScriptRoot '..\Actions\Github-Helper.psm1' -Resolve)
 
+Describe 'InvokeWebRequest authentication fallback' {
+    BeforeAll {
+        if (-not ('ALGoUnauthorizedResponse' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+
+public sealed class ALGoUnauthorizedResponse : WebResponse
+{
+    public override Uri ResponseUri
+    {
+        get { return new Uri("https://api.example.test/repos/owner/repo/properties/values"); }
+    }
+    public HttpStatusCode StatusCode
+    {
+        get { return HttpStatusCode.Unauthorized; }
+    }
+}
+'@
+        }
+    }
+
+    BeforeEach {
+        Mock Write-Host -ModuleName Github-Helper {}
+        Mock GetExtendedErrorMessage -ModuleName Github-Helper { '401 Unauthorized' }
+        Mock Invoke-WebRequest -ModuleName Github-Helper {
+            if ($Method -eq 'Head') {
+                return @{ StatusCode = 200 }
+            }
+            if ($Headers.ContainsKey('Authorization')) {
+                throw [System.Net.WebException]::new(
+                    '401 Unauthorized', $null, [System.Net.WebExceptionStatus]::ProtocolError,
+                    [ALGoUnauthorizedResponse]::new())
+            }
+            return @{ Content = '[]' }
+        }
+    }
+
+    It 'Does not probe or retry anonymously when authentication is required' {
+        {
+            InvokeWebRequest -headers @{ Authorization = 'token invalid' } -method GET `
+                -uri 'https://api.example.test/repos/owner/repo/properties/values' -NoAnonymousFallback
+        } | Should -Throw '*401 Unauthorized*'
+
+        Should -Invoke Invoke-WebRequest -ModuleName Github-Helper -Times 1 -Exactly
+        Should -Invoke Invoke-WebRequest -ModuleName Github-Helper -Times 0 -Exactly -ParameterFilter { $Method -eq 'Head' }
+    }
+
+    It 'Preserves anonymous fallback for existing callers' {
+        $result = InvokeWebRequest -headers @{ Authorization = 'token invalid' } -method GET `
+            -uri 'https://api.example.test/repos/owner/repo/properties/values'
+
+        $result.Content | Should -Be '[]'
+        Should -Invoke Invoke-WebRequest -ModuleName Github-Helper -Times 3 -Exactly
+        Should -Invoke Invoke-WebRequest -ModuleName Github-Helper -Times 1 -Exactly -ParameterFilter { $Method -eq 'Head' }
+    }
+}
+
 Describe "FindLatestSuccessfulCICDRun" {
     BeforeAll {
         . (Join-Path $PSScriptRoot '../Actions/AL-Go-Helper.ps1')
@@ -132,6 +190,60 @@ Describe "CheckBuildJobsInWorkflowRun" {
         finally {
             $ENV:GITHUB_API_URL = $originalApiUrl
         }
+    }
+}
+
+Describe "GetGitHubAppAuthToken" {
+    BeforeEach {
+        $script:installationResponses = [System.Collections.Queue]::new()
+        $script:tokenResponses = [System.Collections.Queue]::new()
+        Mock Start-Sleep -ModuleName Github-Helper {}
+        Mock Write-Host -ModuleName Github-Helper {}
+        Mock Write-Warning -ModuleName Github-Helper {}
+        Mock GenerateJwtForTokenRequest -ModuleName Github-Helper { 'jwt' }
+        Mock Invoke-RestMethod -ModuleName Github-Helper -ParameterFilter { $Method -eq 'GET' } {
+            $response = $script:installationResponses.Dequeue()
+            if ($response -is [System.Exception]) { throw $response }
+            $response
+        }
+        Mock Invoke-RestMethod -ModuleName Github-Helper -ParameterFilter { $Method -eq 'POST' } {
+            $response = $script:tokenResponses.Dequeue()
+            if ($response -is [System.Exception]) { throw $response }
+            $response
+        }
+    }
+
+    It 'retries a transient failure of the installation lookup' {
+        $script:installationResponses.Enqueue([System.Exception]::new('Response status code does not indicate success: 404 (Not Found).'))
+        $script:installationResponses.Enqueue(@{ access_tokens_url = 'https://api.github.com/app/installations/1/access_tokens' })
+        $script:tokenResponses.Enqueue(@{ token = 'installation-token' })
+
+        GetGitHubAppAuthToken -gitHubAppClientId 'clientId' -privateKey 'key' -api_url 'https://api.github.com' -repository 'test/repo' | Should -BeExactly 'installation-token'
+
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 2 -Exactly -ParameterFilter { $Method -eq 'GET' -and $Uri -eq 'https://api.github.com/repos/test/repo/installation' }
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' }
+        Should -Invoke Start-Sleep -ModuleName Github-Helper -Times 1 -Exactly
+    }
+
+    It 'retries a transient failure of the token request' {
+        $script:installationResponses.Enqueue(@{ access_tokens_url = 'https://api.github.com/app/installations/1/access_tokens' })
+        $script:tokenResponses.Enqueue([System.Exception]::new('Response status code does not indicate success: 502 (Bad Gateway).'))
+        $script:tokenResponses.Enqueue(@{ token = 'installation-token' })
+
+        GetGitHubAppAuthToken -gitHubAppClientId 'clientId' -privateKey 'key' -api_url 'https://api.github.com' -repository 'test/repo' | Should -BeExactly 'installation-token'
+
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 1 -Exactly -ParameterFilter { $Method -eq 'GET' }
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 2 -Exactly -ParameterFilter { $Method -eq 'POST' -and $Uri -eq 'https://api.github.com/app/installations/1/access_tokens' }
+    }
+
+    It 'propagates the installation lookup failure after three attempts' {
+        1..3 | ForEach-Object { $script:installationResponses.Enqueue([System.Exception]::new('Response status code does not indicate success: 404 (Not Found).')) }
+
+        { GetGitHubAppAuthToken -gitHubAppClientId 'clientId' -privateKey 'key' -api_url 'https://api.github.com' -repository 'test/repo' } | Should -Throw '*404 (Not Found)*'
+
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 3 -Exactly -ParameterFilter { $Method -eq 'GET' }
+        Should -Invoke Invoke-RestMethod -ModuleName Github-Helper -Times 0 -Exactly -ParameterFilter { $Method -eq 'POST' }
+        Should -Invoke Start-Sleep -ModuleName Github-Helper -Times 2 -Exactly
     }
 }
 

@@ -54,13 +54,20 @@ function GetExtendedErrorMessage {
     $message
 }
 
+<#
+    .SYNOPSIS
+    Invokes a web request with GitHub error handling and retries.
+    .PARAMETER NoAnonymousFallback
+    Prevents retrying an unauthorized request without authentication.
+#>
 function InvokeWebRequest {
     Param(
         [Hashtable] $headers,
         [string] $method,
         [string] $body,
         [string] $outFile,
-        [string] $uri
+        [string] $uri,
+        [switch] $NoAnonymousFallback
     )
 
     $params = @{ "UseBasicParsing" = $true }
@@ -102,7 +109,7 @@ function InvokeWebRequest {
                     continue
                 }
             }
-            if ($response.StatusCode -eq 401) {
+            if ($response.StatusCode -eq 401 -and -not $NoAnonymousFallback) {
                 if ($params.ContainsKey('Headers') -and $params.Headers.ContainsKey('Authorization')) {
                     $publicResponse = Invoke-WebRequest -Method Head -Uri $uri -ErrorAction SilentlyContinue
                     if ($publicResponse -and $publicResponse.StatusCode -eq 200) {
@@ -1391,7 +1398,10 @@ function GetGitHubAppAuthToken {
         "X-GitHub-Api-Version" = "2022-11-28"
     }
     Write-Host "Get App Info $api_url/repos/$repository/installation"
-    $appinfo = Invoke-RestMethod -Method GET -UseBasicParsing -Headers $headers -Uri "$api_url/repos/$repository/installation"
+    # GitHub occasionally returns a transient 404 for an installed app
+    $appinfo = Invoke-CommandWithRetry -RetryCount 3 -FirstDelay 5 -ScriptBlock {
+        Invoke-RestMethod -Method GET -UseBasicParsing -Headers $headers -Uri "$api_url/repos/$repository/installation"
+    }
     $body = @{}
     # If repositories are provided, limit the requested repositories to those
     if ($repositories) {
@@ -1402,7 +1412,9 @@ function GetGitHubAppAuthToken {
         $body += @{ "permissions" = $permissions }
     }
     Write-Host "Get Token Response $($appInfo.access_tokens_url) with $($body | ConvertTo-Json -Compress)"
-    $tokenResponse = Invoke-RestMethod -Method POST -UseBasicParsing -Headers $headers -Body ($body | ConvertTo-Json -Compress) -Uri $appInfo.access_tokens_url
+    $tokenResponse = Invoke-CommandWithRetry -RetryCount 3 -FirstDelay 5 -ScriptBlock {
+        Invoke-RestMethod -Method POST -UseBasicParsing -Headers $headers -Body ($body | ConvertTo-Json -Compress) -Uri $appInfo.access_tokens_url
+    }
     return $tokenResponse.token
 }
 
